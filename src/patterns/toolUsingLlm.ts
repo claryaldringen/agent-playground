@@ -1,5 +1,7 @@
 /*
  * Easiest agent pattern: LLM decides whether to call a tool or answer directly.
+ *
+ * v2: Same pattern but with a reliability layer
  */
 
 import { Json, Llm, Tool } from "../core/types";
@@ -48,24 +50,45 @@ const parseDecision = (text: string): AgentDecision => {
   throw new Error('LLM must return type "final" or "tool".');
 };
 
+type MsgRole = "system" | "user" | "assistant" | "tool";
+type Msg = { role: MsgRole; content: string };
+
+const formatContext = (msgs: Msg[]) =>
+  msgs
+    .map((m) => {
+      if (m.role === "tool") return `TOOL: ${m.content}`;
+      if (m.role === "system") return `SYSTEM: ${m.content}`;
+      if (m.role === "user") return `USER: ${m.content}`;
+      return `ASSISTANT: ${m.content}`;
+    })
+    .join("\n");
+
 type ToolUsingLlmArgs = {
   llm: Llm;
   tools: Tool[];
   userPrompt: string;
   maxSteps?: number;
+  contextWindow?: number;
+  maxToolRetries?: number;
 };
 
 export const run = async (args: ToolUsingLlmArgs) => {
   const maxSteps = args.maxSteps ?? 6;
+  const contextWindow = args.contextWindow ?? 20;
+  const maxToolRetries = args.maxToolRetries ?? 1;
 
   const toolList = args.tools
     .map((tool) => ` - ${tool.name}: ${tool.description}`)
     .join("\n");
 
-  const messages: string[] = [];
-  messages.push(`USER: ${args.userPrompt}`);
+  const messages: Msg[] = [];
+  messages.push({ role: "user", content: args.userPrompt });
 
-  for(let step = 1; step < maxSteps; step++) {
+  const toolRetryCount = new Map<string, number>();
+
+  for (let step = 1; step <= maxSteps; step++) {
+    const ctx = messages.slice(-contextWindow);
+
     const prompt = [
       `You are a tool-using assistant.`,
       ``,
@@ -73,12 +96,16 @@ export const run = async (args: ToolUsingLlmArgs) => {
       toolList || "(none)",
       ``,
       `RULES:`,
-      ` - If you need a tool, return ONLY valid JSON: {"type":"tool","name":"toolName","input":{...}}`,
-      ` - If you can answer now, return ONLY valid JSON: {"type":"final","answer":"..."} `,
-      ` - No extra text, no markdown.`,
+      ` - Return ONLY valid JSON, no extra text, no markdown.`,
+      ` - If you need a tool: {"type":"tool","name":"toolName","input":{...}}`,
+      ` - If you can answer now: {"type":"final","answer":"..."}`,
+      ` - If a tool fails (TOOL returned ERROR), either:`,
+      `    (a) retry with corrected input (at most ${maxToolRetries} time(s) for the same call), or`,
+      `    (b) choose a different tool, or`,
+      `    (c) return a final answer explaining the limitation.`,
       ``,
       `CONTEXT:`,
-      messages.join("\n"),
+      formatContext(ctx),
     ].join("\n");
 
     const llmText = await args.llm.generate(prompt);
@@ -87,36 +114,72 @@ export const run = async (args: ToolUsingLlmArgs) => {
     try {
       decision = parseDecision(llmText);
     } catch (e) {
-      messages.push(
-        `SYSTEM: Your last output was invalid JSON. Error: ${String(e)}`,
-      );
-      messages.push(
-        `SYSTEM: Output MUST be strictly one of the two JSON shapes.`,
-      );
+      messages.push({
+        role: "system",
+        content:
+          `Your last output was invalid. Error: ${String(e)}. ` +
+          `Output MUST be strictly one of the two JSON shapes.`,
+      });
       continue;
     }
 
-    if(decision.type === "final") {
+    if (decision.type === "final") {
       return { ok: true, answer: decision.answer, steps: step };
     }
 
-    const tool = args.tools.find(({name}) => name === decision.name)
+    const tool = args.tools.find(({ name }) => name === decision.name);
 
-    if(!tool) {
-      messages.push(
-        `SYSTEM: The tool "${decision.name}" is not in list of tools.`,
-      );
+    if (!tool) {
+      messages.push({
+        role: "system",
+        content: `The tool "${decision.name}" is not in the list of tools.`,
+      });
       continue;
     }
 
+    const toolCallJson = JSON.stringify({
+      type: "tool",
+      name: decision.name,
+      input: decision.input,
+    });
+
+    messages.push({ role: "assistant", content: toolCallJson });
+
+    const callKey = `${decision.name}::${JSON.stringify(decision.input)}`;
+    const tries = toolRetryCount.get(callKey) ?? 0;
+
     const result = await tool.invoke(decision.input);
 
-    messages.push(
-      `ASSISTANT: {"type":"tool","name":"${decision.name}","input":${JSON.stringify(decision.input)}}`,
-    );
-    messages.push(
-      `TOOL_RESULT(${decision.name}): ${result.ok ? JSON.stringify(result.data) : `ERROR: ${result.error}`}`,
-    );
+    if (result.ok) {
+      messages.push({
+        role: "tool",
+        content: JSON.stringify({
+          name: decision.name,
+          ok: true,
+          data: result.data,
+        }),
+      });
+    } else {
+      messages.push({
+        role: "tool",
+        content: JSON.stringify({
+          name: decision.name,
+          ok: false,
+          error: result.error,
+        }),
+      });
+
+      toolRetryCount.set(callKey, tries + 1);
+
+      if (tries + 1 > maxToolRetries) {
+        messages.push({
+          role: "system",
+          content:
+            `Tool "${decision.name}" failed repeatedly for the same input. ` +
+            `Do NOT call it again with the same input; change strategy or answer.`,
+        });
+      }
+    }
   }
 
   return {
