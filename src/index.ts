@@ -1,17 +1,18 @@
 import { calc } from "./tools/calc";
 import { run } from "./patterns/toolUsingLlm";
 import { createMockLlm } from "./llm/mockLlm";
+import { createOllamaLlm } from "./llm/ollama";
 
 const main = async () => {
   const tools = [calc];
-  const llm = createMockLlm();
+  const llm = createOllamaLlm({ model: "llama3.1" });
 
   const result = await run({
     tools,
     llm,
     userPrompt:
-      "Compute VAT (DPH) for net 123.45 at 19% and add shipping 6.90.",
-    maxSteps: 3
+      "Při prodeji knihy je komise 60% a manipulační poplatek je 29 Kč. Jaká je prodejní cena, aby komise byla 0 Kč?",
+    maxSteps: 6,
   });
 
   console.log(result);
